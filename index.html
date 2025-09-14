@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Authority – Live Geofence</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+<style>
+  :root {
+    --bg-soft: #FFE1D7;
+    --blue-light: #84AFFB;
+    --blue-deep: #0259DD;
+    --accent: #FF6648;
+  }
+
+  body {
+    margin:0;
+    font-family: 'Segoe UI', sans-serif;
+    background: var(--bg-soft);
+    color: var(--blue-deep);
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* Sidebar */
+  #sidebar {
+    width: 260px;
+    background: var(--blue-light);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    box-shadow: 4px 0 12px rgba(0,0,0,0.1);
+  }
+
+  #sidebar h2 {
+    text-align: center;
+    margin-bottom: 10px;
+    font-weight: 700;
+  }
+
+  #sidebar button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 12px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 15px;
+    transition: background 0.3s ease;
+  }
+  #sidebar button:hover {
+    background: var(--blue-deep);
+  }
+
+  #zoneInfo {
+    background: #fff;
+    padding: 10px;
+    border-radius: 8px;
+    text-align: center;
+    color: var(--blue-deep);
+    font-weight: 600;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  }
+
+  /* Map box */
+  #map-container {
+    flex: 1;
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #map {
+    width: 100%;
+    height: 100%;
+    border-radius: 20px;
+    border: 3px solid var(--blue-light);
+    box-shadow: 0 6px 16px rgba(0,0,0,0.2);
+  }
+</style>
+</head>
+<body>
+  <!-- Sidebar for all controls -->
+  <div id="sidebar">
+    <h2>Geo-Fence Admin</h2>
+    <button id="drawPolygonBtn">Draw Polygon</button>
+    <button id="drawCircleBtn">Draw Circle</button>
+    <button id="moveZoneBtn">Move/Edit Zone</button>
+    <button id="deleteZoneBtn">Delete Zone</button>
+    <button id="fitAllBtn">Fit All</button>
+    <div id="zoneInfo">No Zone Set</div>
+  </div>
+
+  <!-- Map container -->
+  <div id="map-container">
+    <div id="map"></div>
+  </div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getDatabase, ref, set, remove, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "geo-fencing-202f9.firebaseapp.com",
+  databaseURL: "https://geo-fencing-202f9-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "geo-fencing-202f9",
+  storageBucket: "geo-fencing-202f9.appspot.com",
+  messagingSenderId: "SENDER_ID",
+  appId: "APP_ID"
+};
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+// --- Map setup ---
+const map = L.map('map', { zoomControl:true }).setView([20.5937,78.9629], 6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution:'&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+const drawnItems = new L.FeatureGroup().addTo(map);
+let currentZoneLayer = null;
+let touristMarkers = {};
+let editMode = false;
+let firstFitDone = false;
+
+const drawOpts = {
+  draw: {
+    polygon: { allowIntersection:false, shapeOptions:{color:'#FF6648'} },
+    circle: { shapeOptions:{color:'#FF6648'} },
+    rectangle:false, marker:false, polyline:false, circlemarker:false
+  },
+  edit: { featureGroup: drawnItems, edit:false, remove:false }
+};
+
+// Buttons
+document.getElementById('drawPolygonBtn').onclick = () =>
+  new L.Draw.Polygon(map, drawOpts.draw.polygon).enable();
+document.getElementById('drawCircleBtn').onclick = () =>
+  new L.Draw.Circle(map, drawOpts.draw.circle).enable();
+document.getElementById('moveZoneBtn').onclick = () => {
+  if (!currentZoneLayer || editMode) return;
+  editMode = true;
+  const editCtrl = new L.Control.Draw({
+    draw:false,
+    edit:{ featureGroup: drawnItems, edit:true, remove:false }
+  });
+  map.addControl(editCtrl);
+  map.once(L.Draw.Event.EDITED, () => {
+    saveZone();
+    map.removeControl(editCtrl);
+    editMode = false;
+  });
+};
+document.getElementById('deleteZoneBtn').onclick = async () => {
+  if (currentZoneLayer) drawnItems.removeLayer(currentZoneLayer);
+  currentZoneLayer = null;
+  await remove(ref(db,'zones/currentZone'));
+  document.getElementById('zoneInfo').textContent = "Zone Deleted";
+};
+document.getElementById('fitAllBtn').onclick = fitAll;
+
+// Save Zone
+function saveZone() {
+  if (!currentZoneLayer) return;
+  if (currentZoneLayer instanceof L.Circle) {
+    const c = currentZoneLayer.getLatLng();
+    set(ref(db,'zones/currentZone'), {
+      type:'circle',
+      center:{lat:c.lat, lng:c.lng},
+      radius:currentZoneLayer.getRadius()
+    });
+    document.getElementById('zoneInfo').textContent =
+      `Circle Zone (radius ${Math.round(currentZoneLayer.getRadius())} m)`;
+  } else {
+    const pts = currentZoneLayer.getLatLngs()[0].map(p=>({lat:p.lat,lng:p.lng}));
+    set(ref(db,'zones/currentZone'), { type:'polygon', points:pts });
+    document.getElementById('zoneInfo').textContent =
+      `Polygon Zone (${pts.length} pts)`;
+  }
+}
+
+// Draw Created
+map.on(L.Draw.Event.CREATED, e => {
+  if (currentZoneLayer) drawnItems.removeLayer(currentZoneLayer);
+  currentZoneLayer = e.layer;
+  drawnItems.addLayer(currentZoneLayer);
+  saveZone();
+  fitAll();
+});
+
+// Load Existing Zone
+onValue(ref(db,'zones/currentZone'), snap => {
+  const z = snap.val();
+  if (!z) return;
+  if (currentZoneLayer) drawnItems.removeLayer(currentZoneLayer);
+  if (z.type==='circle'){
+    currentZoneLayer = L.circle([z.center.lat,z.center.lng],
+      {radius:z.radius,color:'#FF6648'});
+  } else if (z.type==='polygon'){
+    currentZoneLayer = L.polygon(z.points.map(p=>[p.lat,p.lng]), {color:'#FF6648'});
+  }
+  drawnItems.addLayer(currentZoneLayer);
+  fitAll();
+});
+
+// Live tourists
+onValue(ref(db,'tourists'), snapshot => {
+  const data = snapshot.val() || {};
+  for (const id in touristMarkers){
+    if(!data[id]) { map.removeLayer(touristMarkers[id]); delete touristMarkers[id]; }
+  }
+  for (const id in data){
+    const t = data[id];
+    const lat = t.latitude ?? t.lat;
+    const lng = t.longitude ?? t.lng;
+    if(typeof lat !== 'number' || typeof lng !== 'number') continue;
+    if(!touristMarkers[id]){
+      touristMarkers[id] = L.marker([lat,lng])
+        .addTo(map)
+        .bindPopup(`Tourist: ${id}`);
+      touristMarkers[id].state = { outside:false };
+    } else {
+      touristMarkers[id].setLatLng([lat,lng]);
+    }
+    checkInsideZone(id, lat, lng);
+  }
+  fitAll();
+});
+
+function checkInsideZone(id, lat, lng){
+  if (!currentZoneLayer) return;
+  let inside = false;
+  if (currentZoneLayer instanceof L.Circle) {
+    inside = currentZoneLayer.getLatLng().distanceTo([lat,lng]) <= currentZoneLayer.getRadius();
+  } else {
+    inside = leafletPip.pointInLayer([lng,lat], currentZoneLayer, true).length > 0;
+  }
+  const marker = touristMarkers[id];
+  if (!marker) return;
+  if (!inside && !marker.state.outside) {
+    marker.state.outside = true;
+    marker.bindPopup(`<b>${id}</b><br><span style="color:red">Outside Zone!</span>`).openPopup();
+    alert(`⚠️ Tourist ${id} left the zone!`);
+  } else if (inside && marker.state.outside) {
+    marker.state.outside = false;
+    marker.bindPopup(`<b>${id}</b><br><span style="color:green">Inside Zone</span>`);
+  }
+}
+
+function fitAll(){
+  const group = L.featureGroup([
+    ...Object.values(touristMarkers),
+    ...drawnItems.getLayers()
+  ]);
+  if(group.getLayers().length === 0) return;
+  if (!firstFitDone) {
+    map.fitBounds(group.getBounds(), { padding:[40,40] });
+    firstFitDone = true;
+  }
+}
+</script>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/leaflet-pip/leaflet-pip.min.js"></script>
+</body>
+</html>
